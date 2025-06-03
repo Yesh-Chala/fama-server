@@ -659,14 +659,11 @@ signal.signal(signal.SIGINT, signal_handler)
 # Register cleanup function for normal exit
 
 if __name__ == "__main__":
-    # For production deployment
-    config = uvicorn.Config(
-        app, 
-        host="0.0.0.0", 
-        port=8000, 
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
         log_level="info",
-        access_log=True,
-        loop="asyncio"
+        access_log=True
     )
-    server = uvicorn.Server(config)
-    server.run()
