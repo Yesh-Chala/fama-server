@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 nest_asyncio.apply()
-
+print("🔍 DEBUG:", os.getenv("REDDIT_CLIENT_ID"))
 # 🔧 GLOBAL CONFIG - Will be updated by API requests
 QUESTION = "Why does everybody want to become an influencer?"
 KEYWORDS = ["influencer", "content creator", "social media", "fame", "followers",
