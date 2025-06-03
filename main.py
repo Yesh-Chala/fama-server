@@ -502,6 +502,8 @@ async def get_status():
         messages=status_messages[-20:]  # Last 20 messages
     )
 
+
+
 @app.post("/analyze")
 async def analyze_reddit(request: AnalysisRequest):
     """Run Reddit analysis with provided parameters"""
