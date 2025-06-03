@@ -1,5 +1,5 @@
-# FastAPI Reddit Analysis Server - Fixed Version
-# Fixes: Proper async resource management, better error handling, graceful shutdown
+# FastAPI Reddit Analysis Server - Enhanced Fixed Version
+# Fixes: Proper graceful shutdown, better resource management, improved error handling
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -21,13 +21,15 @@ import signal
 import sys
 from contextlib import asynccontextmanager
 import logging
+import atexit
+import weakref
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 nest_asyncio.apply()
-print("🔍 DEBUG:", os.getenv("REDDIT_CLIENT_ID"))
+
 # 🔧 GLOBAL CONFIG - Will be updated by API requests
 QUESTION = "Why does everybody want to become an influencer?"
 KEYWORDS = ["influencer", "content creator", "social media", "fame", "followers",
@@ -66,8 +68,10 @@ DAYS_BACK = 60
 openai.api_key = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
 
-# Global Reddit client - will be initialized in lifespan
+# Global Reddit client and shutdown handling
 reddit = None
+shutdown_event = asyncio.Event()
+_cleanup_tasks = set()
 
 SYSTEM_PROMPT = """
 ## Premium Market Research & Consumer Psychology Report Generator
@@ -203,6 +207,30 @@ def update_status(message):
 cutoff_timestamp = time.time() - DAYS_BACK * 86400
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
+# Improved cleanup function
+async def cleanup_resources():
+    """Cleanup all async resources properly"""
+    global reddit
+    logger.info("🧹 Starting resource cleanup...")
+    
+    if reddit:
+        try:
+            await reddit.close()
+            logger.info("✅ Reddit client closed properly")
+        except Exception as e:
+            logger.error(f"⚠️ Error closing Reddit client: {e}")
+    
+    # Cancel any remaining tasks
+    for task in _cleanup_tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    
+    logger.info("✅ Resource cleanup complete")
+
 # Lifespan management for proper async resource handling
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -221,16 +249,11 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Failed to initialize Reddit client: {e}")
         raise
     
-    yield  # Application runs here
-    
-    # Cleanup on shutdown
-    logger.info("🔄 Shutting down application...")
-    if reddit:
-        try:
-            await reddit.close()
-            logger.info("✅ Reddit client closed properly")
-        except Exception as e:
-            logger.error(f"⚠️ Error closing Reddit client: {e}")
+    try:
+        yield  # Application runs here
+    finally:
+        # Cleanup on shutdown
+        await cleanup_resources()
 
 # FastAPI app with lifespan management
 app = FastAPI(
@@ -260,13 +283,20 @@ class StatusResponse(BaseModel):
     current_status: str
     messages: List[str]
 
-# Core analysis functions with better error handling
+# Core analysis functions with better error handling and cancellation support
 async def fetch_initial_posts():
     results = []
     for sub_name in TARGET_SUBREDDITS:
+        if shutdown_event.is_set():
+            logger.info("🛑 Shutdown requested, stopping fetch_initial_posts")
+            break
+            
         try:
             subreddit = await reddit.subreddit(sub_name)
             for keyword in EXPANDED_KEYWORDS:
+                if shutdown_event.is_set():
+                    break
+                    
                 try:
                     async for submission in subreddit.search(
                         keyword, 
@@ -274,6 +304,8 @@ async def fetch_initial_posts():
                         time_filter="month", 
                         limit=TOP_K_INITIAL_RESULTS // len(TARGET_SUBREDDITS)
                     ):
+                        if shutdown_event.is_set():
+                            break
                         if submission.created_utc < cutoff_timestamp:
                             continue
                         results.append(submission)
@@ -288,6 +320,9 @@ async def fetch_initial_posts():
     return results
 
 async def extract_post_meta(submission):
+    if shutdown_event.is_set():
+        return None
+        
     try:
         await submission.load()
         return {
@@ -306,9 +341,16 @@ async def extract_post_meta(submission):
 async def tier_two_search(subreddit_names):
     final_results = []
     for name in set(subreddit_names):
+        if shutdown_event.is_set():
+            logger.info("🛑 Shutdown requested, stopping tier_two_search")
+            break
+            
         try:
             subreddit = await reddit.subreddit(name)
             for keyword in EXPANDED_KEYWORDS:
+                if shutdown_event.is_set():
+                    break
+                    
                 try:
                     async for submission in subreddit.search(
                         keyword, 
@@ -316,6 +358,8 @@ async def tier_two_search(subreddit_names):
                         time_filter="month", 
                         limit=10
                     ):
+                        if shutdown_event.is_set():
+                            break
                         if submission.created_utc < cutoff_timestamp:
                             continue
                         final_results.append(submission)
@@ -330,6 +374,9 @@ async def tier_two_search(subreddit_names):
     return final_results
 
 async def extract_thread(submission):
+    if shutdown_event.is_set():
+        return None
+        
     try:
         await submission.load()
         await submission.comments.replace_more(limit=0)
@@ -340,10 +387,15 @@ async def extract_thread(submission):
         thread["comments"] = []
 
         for comment in submission.comments:
+            if shutdown_event.is_set():
+                break
+                
             try:
                 if hasattr(comment, "body") and comment.body:
                     replies = []
                     for reply in comment.replies:
+                        if shutdown_event.is_set():
+                            break
                         try:
                             if hasattr(reply, "body") and reply.body:
                                 replies.append({
@@ -368,6 +420,9 @@ async def extract_thread(submission):
         return None
 
 async def upload_to_assistant_and_analyze(file_path):
+    if shutdown_event.is_set():
+        raise RuntimeError("Analysis cancelled due to shutdown")
+        
     try:
         with open(file_path, "rb") as f:
             uploaded_file = openai.files.create(file=f, purpose="assistants")
@@ -397,6 +452,9 @@ async def upload_to_assistant_and_analyze(file_path):
         start_time = time.time()
         
         while time.time() - start_time < max_wait_time:
+            if shutdown_event.is_set():
+                raise RuntimeError("Analysis cancelled due to shutdown")
+                
             status = openai.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
             if status.status == "completed":
                 break
@@ -421,12 +479,18 @@ async def run_analysis():
     global QUESTION, KEYWORDS, EXPANDED_KEYWORDS, TARGET_SUBREDDITS
 
     try:
+        if shutdown_event.is_set():
+            raise RuntimeError("Analysis cancelled due to shutdown")
+            
         update_status("Tier 1 search starting...")
         posts = await fetch_initial_posts()
         update_status(f"Tier 1 complete. Found {len(posts)} posts.")
 
         if not posts:
             raise RuntimeError("No posts found in tier 1 search")
+
+        if shutdown_event.is_set():
+            raise RuntimeError("Analysis cancelled due to shutdown")
 
         subreddits = [p.subreddit.display_name for p in posts if p.subreddit.display_name.lower() != "all"]
         update_status("Tier 2 search starting...")
@@ -438,6 +502,9 @@ async def run_analysis():
 
         if not combined:
             raise RuntimeError("No posts found after combining tiers")
+
+        if shutdown_event.is_set():
+            raise RuntimeError("Analysis cancelled due to shutdown")
 
         question_embedding = model.encode(QUESTION, convert_to_tensor=True)
         post_texts = []
@@ -456,7 +523,7 @@ async def run_analysis():
         update_status("Extracting thread details...")
         
         for i, (submission, sim) in enumerate(top_posts):
-            if i >= MAX_EXTRACTED:
+            if i >= MAX_EXTRACTED or shutdown_event.is_set():
                 break
             thread = await extract_thread(submission)
             if thread:
@@ -465,6 +532,9 @@ async def run_analysis():
 
         if not extracted:
             raise RuntimeError("No threads extracted successfully")
+
+        if shutdown_event.is_set():
+            raise RuntimeError("Analysis cancelled due to shutdown")
 
         output_file = f"fama_reddit_output_{int(time.time())}.json"
         with open(output_file, "w") as f:
@@ -491,23 +561,26 @@ async def health_check():
     return {
         "status": "healthy", 
         "timestamp": datetime.datetime.now().isoformat(),
-        "reddit_connected": reddit is not None
+        "reddit_connected": reddit is not None,
+        "shutdown_requested": shutdown_event.is_set()
     }
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
     """Get current analysis status and messages"""
     return StatusResponse(
-        current_status=current_status, 
+        current_status=current_status + (" (shutdown requested)" if shutdown_event.is_set() else ""), 
         messages=status_messages[-20:]  # Last 20 messages
     )
-
-
 
 @app.post("/analyze")
 async def analyze_reddit(request: AnalysisRequest):
     """Run Reddit analysis with provided parameters"""
     global QUESTION, KEYWORDS, EXPANDED_KEYWORDS, TARGET_SUBREDDITS, status_messages
+
+    # Check if shutdown is requested
+    if shutdown_event.is_set():
+        raise HTTPException(status_code=503, detail="Server is shutting down")
 
     # Validate environment variables
     required_env_vars = ["OPENAI_API_KEY", "OPENAI_ASSISTANT_ID", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"]
@@ -532,14 +605,34 @@ async def analyze_reddit(request: AnalysisRequest):
     update_status(f"Targeting {len(TARGET_SUBREDDITS)} subreddits")
 
     try:
-        result = await run_analysis()
+        # Create task and track it for cleanup
+        task = asyncio.create_task(run_analysis())
+        _cleanup_tasks.add(task)
+        
+        try:
+            result = await task
+        finally:
+            _cleanup_tasks.discard(task)
+            
         return {
             "status": "success",
             "question": QUESTION,
-            "analysis_result": result if result else "No result returned.",
+            "analysis_result": result["result"] if result else "No result returned.",
             "file_id": result["file_id"] if result else None,
             "timestamp": datetime.datetime.now().isoformat()
         }
+    except asyncio.CancelledError:
+        error_msg = "Analysis was cancelled"
+        update_status(error_msg)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "cancelled",
+                "message": error_msg,
+                "question": QUESTION,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+        )
     except Exception as e:
         error_msg = f"Analysis failed: {str(e)}"
         update_status(error_msg)
@@ -554,7 +647,6 @@ async def analyze_reddit(request: AnalysisRequest):
             }
         )
 
-
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
@@ -565,23 +657,40 @@ async def root():
             "status": "/status - Current analysis status",
             "analyze": "/analyze - Run Reddit analysis (POST)"
         },
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "shutdown_requested": shutdown_event.is_set()
     }
 
-# Graceful shutdown handler
+# Improved graceful shutdown handler
 def signal_handler(signum, frame):
-    logger.info(f"Received signal {signum}, shutting down gracefully...")
-    sys.exit(0)
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_event.set()
+    
+    # Don't call sys.exit() immediately - let the lifespan handler clean up
+    def delayed_exit():
+        time.sleep(5)  # Give some time for cleanup
+        logger.info("Force exit after cleanup timeout")
+        os._exit(0)
+    
+    # Start a thread for forced exit as backup
+    threading.Thread(target=delayed_exit, daemon=True).start()
 
+# Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
+# Register cleanup function for normal exit
+atexit.register(lambda: asyncio.run(cleanup_resources()) if not shutdown_event.is_set() else None)
+
 if __name__ == "__main__":
     # For production deployment
-    uvicorn.run(
+    config = uvicorn.Config(
         app, 
         host="0.0.0.0", 
         port=8000, 
         log_level="info",
-        access_log=True
+        access_log=True,
+        loop="asyncio"
     )
+    server = uvicorn.Server(config)
+    server.run()
