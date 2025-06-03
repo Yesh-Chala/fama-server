@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+asyncpraw
+nest_asyncio
+openai
+sentence-transformers
+torch
+pyngrok
+pydantic
+aiohttp
+python-multipart
+httpx
+google-auth
+google-api-python-client
