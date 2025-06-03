@@ -660,6 +660,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Starting on port {port}")  # <- This will show in Railway logs
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
