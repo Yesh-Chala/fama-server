@@ -23,6 +23,8 @@ from contextlib import asynccontextmanager
 import logging
 import atexit
 import weakref
+import aiohttp  # make sure this is at the top with other imports
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -71,7 +73,6 @@ ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
 # Global Reddit client and shutdown handling
 reddit = None
 shutdown_event = asyncio.Event()
-_cleanup_tasks = set()
 
 SYSTEM_PROMPT = """
 ## Premium Market Research & Consumer Psychology Report Generator
@@ -207,53 +208,35 @@ def update_status(message):
 cutoff_timestamp = time.time() - DAYS_BACK * 86400
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Improved cleanup function
-async def cleanup_resources():
-    """Cleanup all async resources properly"""
-    global reddit
-    logger.info("🧹 Starting resource cleanup...")
-    
-    if reddit:
-        try:
-            await reddit.close()
-            logger.info("✅ Reddit client closed properly")
-        except Exception as e:
-            logger.error(f"⚠️ Error closing Reddit client: {e}")
-    
-    # Cancel any remaining tasks
-    for task in _cleanup_tasks:
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-    
-    logger.info("✅ Resource cleanup complete")
 
 # Lifespan management for proper async resource handling
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global reddit
     logger.info("🚀 Starting up application...")
-    
-    # Initialize Reddit client
+
+    # ✅ Create custom aiohttp session
+    session = aiohttp.ClientSession()
+
     try:
+        # ✅ Pass session to asyncpraw
         reddit = asyncpraw.Reddit(
             client_id=os.getenv("REDDIT_CLIENT_ID"),
             client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-            user_agent=os.getenv("REDDIT_USER_AGENT", "fama-reddit/0.1 by ProfessionalBison251")
+            user_agent=os.getenv("REDDIT_USER_AGENT", "fama-reddit/0.1"),
+            requestor_kwargs={"session": session}
         )
         logger.info("✅ Reddit client initialized")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Reddit client: {e}")
-        raise
-    
-    try:
-        yield  # Application runs here
+        yield
     finally:
-        # Cleanup on shutdown
-        await cleanup_resources()
+        # ✅ Cleanly close Reddit and aiohttp session
+        logger.info("🔄 Shutting down application...")
+        if reddit:
+            await reddit.close()
+        await session.close()
+        logger.info("✅ aiohttp session closed")
+
 
 # FastAPI app with lifespan management
 app = FastAPI(
@@ -605,15 +588,8 @@ async def analyze_reddit(request: AnalysisRequest):
     update_status(f"Targeting {len(TARGET_SUBREDDITS)} subreddits")
 
     try:
-        # Create task and track it for cleanup
-        task = asyncio.create_task(run_analysis())
-        _cleanup_tasks.add(task)
-        
-        try:
-            result = await task
-        finally:
-            _cleanup_tasks.discard(task)
-            
+        result = await run_analysis()
+
         return {
             "status": "success",
             "question": QUESTION,
@@ -621,6 +597,7 @@ async def analyze_reddit(request: AnalysisRequest):
             "file_id": result["file_id"] if result else None,
             "timestamp": datetime.datetime.now().isoformat()
         }
+
     except asyncio.CancelledError:
         error_msg = "Analysis was cancelled"
         update_status(error_msg)
@@ -680,7 +657,6 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # Register cleanup function for normal exit
-atexit.register(lambda: asyncio.run(cleanup_resources()) if not shutdown_event.is_set() else None)
 
 if __name__ == "__main__":
     # For production deployment
